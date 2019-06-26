@@ -10,8 +10,26 @@ import sqlite3
 import logging
 import shutil
 import pysam
+import json
 import glob
 import os
+
+
+# Methods for putting JSON into/out of our sqlite database.
+# Adapted/taken from: https://chrisostrouchov.com/post/python_sqlite/
+
+def adapt_json(data):
+    return (json.dumps(data, sort_keys=True)).encode()
+
+
+def convert_json(blob):
+    return json.loads(blob.decode())
+
+
+sqlite3.register_adapter(dict, adapt_json)
+sqlite3.register_adapter(list, adapt_json)
+sqlite3.register_adapter(tuple, adapt_json)
+sqlite3.register_converter('JSON', convert_json)
 
 
 def get_args():
@@ -31,7 +49,7 @@ def get_args():
     parser.add_argument('-p', '--p_value',
                         default=0.05,
                         type=float,
-                        help='P-value to report on. NOT YET IMPLEMENTED')
+                        help='P-value to report on. NOT YET IMPLEMENTED.')
     parser.add_argument('-t', '--threads',
                         default=multiprocessing.cpu_count(),
                         type=int,
@@ -150,32 +168,54 @@ def main():
             gene_names.append(s.id)
             sequences.append(s)
         SeqIO.write(sequences, 'genes_and_stuff.fasta', 'fasta')
-        depths = get_depths(args.forward_reads, args.reverse_reads, 'genes_and_stuff.fasta', gene_names)
-        depth_list = list()
-        for gene_name in depths:
-            depth_list.append(depths[gene_name])
-            print('{},{}'.format(gene_name, depths[gene_name]))
-        avg, std = norm.fit(np.array(depth_list))
+        depths, gc_dict = get_depths(args.forward_reads, args.reverse_reads, 'genes_and_stuff.fasta', gene_names)
+        # TODO: Currently re-creating the BAM file in this step, which is a fantastic waste of time.
+        #  Make it so if I provide a BAM to this method we don't recalculate the BAM file.
+        corrected_depths = get_corrected_depths(args.forward_reads, args.reverse_reads, 'genes_and_stuff.fasta',
+                                                gene_names, gc_dict, depths)
+        uncorr_avg, uncorr_std = norm.fit(np.array(depths))
+        logging.info('UNCORRECTED STATS:')
+        logging.info('Median depth: {}'.format(np.median(depths)))
+        logging.info('Normal distribution mean: {}'.format(uncorr_avg))
+        logging.info('Normal distribution stdev: {}'.format(uncorr_std))
+
+        logging.info('\nGC CORRECTED STATS:')
+        avg, std = norm.fit(np.array(corrected_depths))
+        logging.info('Median depth: {}'.format(np.median(corrected_depths)))
+        logging.info('Normal distribution mean: {}'.format(avg))
+        logging.info('Normal distribution stdev: {}'.format(std))
         add_sample_to_database(sample_name=sample_name,
                                avgdepth=avg,
                                stdev=std,
-                               db_name=args.database)
-
+                               db_name=args.database,
+                               gc_dict=gc_dict)
     else:
-        avg, std = db_check
+        avg, std, gc_dict = db_check
     # Now find out if our gene of interest is outside our distribution.
     gene_names = list()
     for s in SeqIO.parse(args.gene_fasta_file, 'fasta'):
         gene_names.append(s.id)
-    depths = get_depths(args.forward_reads, args.reverse_reads, args.gene_fasta_file, gene_names)
+    depths = get_corrected_depths_per_gene(args.forward_reads, args.reverse_reads, args.gene_fasta_file, gene_names, gc_dict,
+                                           avg)
     logging.info('Average:{}\nStdev:{}\n'.format(avg, std))
-    print('Gene,Depth,CDF')
+    print('Gene,Depth,MostLikely,1Copy,2Copy,3Copy,4Copy,5Copy,6Copy,7Copy,8Copy,9Copy,10Copy')
     for gene_name in depths:
         depth = depths[gene_name]
-        print(find_most_likely_copy_number(single_copy_mean=avg,
-                                           single_copy_stdev=std,
-                                           max_copy_number=10,
-                                           depth=depth))
+        copy_dict = find_most_likely_copy_number(single_copy_mean=avg,
+                                                 single_copy_stdev=std,
+                                                 max_copy_number=10,
+                                                 depth=depth)
+        outstr = '{},{},'.format(gene_name, depth)
+        highest_value = 0
+        most_likely = 'NA'
+        for i in range(1, 11):
+            if copy_dict[i] > highest_value:
+                most_likely = i
+                highest_value = copy_dict[i]
+        outstr += '{},'.format(most_likely)
+        for i in range(1, 11):
+            outstr += '{},'.format(copy_dict[i])
+        print(outstr)
 
 
 def check_for_sample_in_database(sample_name, db_name):
@@ -185,7 +225,7 @@ def check_for_sample_in_database(sample_name, db_name):
     conn = sqlite3.connect(db_name)
     c = conn.cursor()
     # Step 1: Create our table if it doesn't already exist.
-    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text, avgdepth real, stdev real)')
+    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text, avgdepth real, stdev real, gc json)')
     conn.commit()
     # See if our sample is there.
     c.execute('SELECT * FROM depths WHERE strain=?', sample_name)
@@ -196,19 +236,19 @@ def check_for_sample_in_database(sample_name, db_name):
         return False
     # If sample is present, return average depth and standard deviation
     else:
-        name, avg, stdev = table_row
-        return (avg, stdev)
+        name, avg, stdev, gc = table_row
+        return (avg, stdev, gc)
 
 
-def add_sample_to_database(sample_name, avgdepth, stdev, db_name):
-    data_to_add = (sample_name, avgdepth, stdev)
+def add_sample_to_database(sample_name, avgdepth, stdev, db_name, gc_dict):
+    data_to_add = (sample_name, avgdepth, stdev, gc_dict)
     conn = sqlite3.connect(db_name)
     c = conn.cursor()
     # Step 1: Create our table if it doesn't already exist.
-    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text, avgdepth real, stdev real)')
+    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text, avgdepth real, stdev real, gc json)')
     conn.commit()
     # Now add our sample and commit changes.
-    c.execute('INSERT INTO depths VALUES (?, ?, ?)', data_to_add)
+    c.execute('INSERT INTO depths VALUES (?, ?, ?, ?)', data_to_add)
     conn.commit()
     conn.close()
 
@@ -219,7 +259,11 @@ def find_most_likely_copy_number(single_copy_mean, single_copy_stdev, max_copy_n
     current_stdev = single_copy_stdev
     for i in range(max_copy_number):
         prob = norm.cdf(depth, current_mean, current_stdev)
-        copy_number_dict[i + 1] = prob
+        if prob <= 0.5:
+            pvalue = 2 * prob
+        else:
+            pvalue = (1 - prob) * 2
+        copy_number_dict[i + 1] = pvalue
         current_mean += single_copy_mean
         # Add 10 percent to current standard deviation so distributions get fatter as we get more copy number.
         # This is definitely my intuition on how things should work, but needs to actually be modeled at some point.
@@ -227,8 +271,8 @@ def find_most_likely_copy_number(single_copy_mean, single_copy_stdev, max_copy_n
     return copy_number_dict
 
 
-def get_depths(forward_reads, reverse_reads, gene_fasta, gene_names):
-    depths = dict()
+def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene_names, gc_dict, corrected_median_depth):
+    corrected_depths = dict()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpfasta = os.path.join(tmpdir, gene_fasta)
         shutil.copy(gene_fasta, tmpfasta)
@@ -251,22 +295,195 @@ def get_depths(forward_reads, reverse_reads, gene_fasta, gene_names):
         cmd = 'samtools index {}'.format(sorted_bam)
         os.system(cmd)
         os.system('samtools faidx {}'.format(gene_fasta))
-        # Now parse through the bamfile and get average depth for each of the sequences.
+        seq_index = SeqIO.index(tmpfasta, 'fasta')
         bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
         for gene_name in gene_names:
-            total_depth = 0
-            bases = 0
-            for column in bamfile.pileup(gene_name, stepper='samtools', ignore_orphans=False,
-                                         fastafile=pysam.FastaFile(gene_fasta),
-                                         min_base_quality=0):
-                bases += 1
-                total_depth += column.n
-            try:
-                depths[gene_name] = total_depth/bases
-            except ZeroDivisionError:
-                pass
+            gene_window_depths = list()
+            # Find out what depth is and put it into corrected_depths dictionary.
+            gene_length = len(seq_index[gene_name].seq)
+            windows = generate_windows(gene_length, window_size=100)
+            for window in windows:
+                total_depth = 0
+                bases = 0
+                gc_bases = 0
+                start_base, end_base = window
+                for column in bamfile.pileup(contig=gene_name, start=start_base, end=end_base,
+                                             stepper='samtools', ignore_orphans=False,
+                                             fastafile=pysam.FastaFile(gene_fasta),
+                                             min_base_quality=0):
+                    ref_base = seq_index[gene_name].seq[column.reference_pos]
+                    if ref_base.upper() == 'G' or ref_base.upper() == 'C':
+                        gc_bases += 1
+                    bases += 1
+                    total_depth += column.nsegments
+                try:
+                    depth = total_depth/bases
+                    gc_content = round(100*gc_bases/bases)
+                    # If we haven't ever seen the gc content of this segment before, can't correct for the gc content.
+                    # Unlikely this will ever happen, but better this than crashing with a KeyError
+                    if gc_content not in gc_dict:
+                        gene_window_depths.append(depth)
+                    # If we have seen this GC content before, apply the correction described in:
+                    # https://genome.cshlp.org/content/19/9/1586.full and
+                    # https://academic.oup.com/bioinformatics/article/31/11/1708/2365681
+                    else:
+                        corrected_depth = (depth * corrected_median_depth)/np.median(gc_dict[gc_content])
+                        gene_window_depths.append(corrected_depth)
+                except ZeroDivisionError:
+                    pass
+            corrected_depths[gene_name] = np.median(gene_window_depths)
         bamfile.close()
-    return depths
+    return corrected_depths
+
+
+def get_corrected_depths(forward_reads, reverse_reads, gene_fasta, gene_names, gc_dict, uncorrected_depths):
+    corrected_depths = list()
+    uncorrected_median = np.median(uncorrected_depths)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpfasta = os.path.join(tmpdir, gene_fasta)
+        shutil.copy(gene_fasta, tmpfasta)
+        outbam = os.path.join(tmpdir, 'out.bam')
+        # Make our bowtie2 index
+        bt2_index = os.path.join(tmpdir, 'bowtie_db')
+        cmd = 'bowtie2-build {} {}'.format(tmpfasta, bt2_index)
+        os.system(cmd)
+        # Now align our reads against created database. Use very sensitive local bowtie settings so we can be
+        # relatively sure we've gotten everything.
+        cmd = 'bowtie2 -p 12 --very-sensitive-local -x {} -1 {} -2 {} | samtools view -bS > {}'.format(bt2_index,
+                                                                                                       forward_reads,
+                                                                                                       reverse_reads,
+                                                                                                       outbam)
+        os.system(cmd)
+        # Sort and index created bamfile so we can parse it
+        sorted_bam = os.path.join(tmpdir, 'out_sorted.bam')
+        cmd = 'samtools sort {} > {}'.format(outbam, sorted_bam)
+        os.system(cmd)
+        cmd = 'samtools index {}'.format(sorted_bam)
+        os.system(cmd)
+        os.system('samtools faidx {}'.format(gene_fasta))
+        seq_index = SeqIO.index(tmpfasta, 'fasta')
+        bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
+        for gene_name in gene_names:
+            # Need to break our gene up into 100 bp windows. Unless the gene we're looking at happens to be a multiple
+            # of 100 in terms of length, this won't quite work. To avoid super small sample sizes that could mess up
+            # our GC correction, set our last window to be the last 100 bases of the gene.
+            # Example: for a gene of length 450, windows go from base 1-100, 101-200, 201-300, 301-400, and 351-450
+            # Does mean we end up oversampling some bases, but seems to me to be better than the alternative of having
+            # really short windows with potentially extremely biased GC content/depths
+            gene_length = len(seq_index[gene_name].seq)
+            windows = generate_windows(gene_length, window_size=100)
+            for window in windows:
+                total_depth = 0
+                bases = 0
+                gc_bases = 0
+                start_base, end_base = window
+                for column in bamfile.pileup(contig=gene_name, start=start_base, end=end_base,
+                                             stepper='samtools', ignore_orphans=False,
+                                             fastafile=pysam.FastaFile(gene_fasta),
+                                             min_base_quality=0):
+                    ref_base = seq_index[gene_name].seq[column.reference_pos]
+                    if ref_base.upper() == 'G' or ref_base.upper() == 'C':
+                        gc_bases += 1
+                    bases += 1
+                    total_depth += column.nsegments
+                try:
+                    depth = total_depth/bases
+                    gc_content = round(100*gc_bases/bases)
+                    # If we haven't ever seen the gc content of this segment before, can't correct for the gc content.
+                    # Unlikely this will ever happen, but better this than crashing with a KeyError
+                    if gc_content not in gc_dict:
+                        corrected_depths.append(depth)
+                    # If we have seen this GC content before, apply the correction described in:
+                    # https://genome.cshlp.org/content/19/9/1586.full and
+                    # https://academic.oup.com/bioinformatics/article/31/11/1708/2365681
+                    else:
+                        corrected_depth = (depth * uncorrected_median)/np.median(gc_dict[gc_content])
+                        corrected_depths.append(corrected_depth)
+                except ZeroDivisionError:
+                    pass
+        bamfile.close()
+    return corrected_depths
+
+
+def get_depths(forward_reads, reverse_reads, gene_fasta, gene_names):
+    depths = list()
+    gc_dict = dict()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpfasta = os.path.join(tmpdir, gene_fasta)
+        shutil.copy(gene_fasta, tmpfasta)
+        outbam = os.path.join(tmpdir, 'out.bam')
+        # Make our bowtie2 index
+        bt2_index = os.path.join(tmpdir, 'bowtie_db')
+        cmd = 'bowtie2-build {} {}'.format(tmpfasta, bt2_index)
+        os.system(cmd)
+        # Now align our reads against created database. Use very sensitive local bowtie settings so we can be
+        # relatively sure we've gotten everything.
+        cmd = 'bowtie2 -p 12 --very-sensitive-local -x {} -1 {} -2 {} | samtools view -bS > {}'.format(bt2_index,
+                                                                                                       forward_reads,
+                                                                                                       reverse_reads,
+                                                                                                       outbam)
+        os.system(cmd)
+        # Sort and index created bamfile so we can parse it
+        sorted_bam = os.path.join(tmpdir, 'out_sorted.bam')
+        cmd = 'samtools sort {} > {}'.format(outbam, sorted_bam)
+        os.system(cmd)
+        cmd = 'samtools index {}'.format(sorted_bam)
+        os.system(cmd)
+        os.system('samtools faidx {}'.format(gene_fasta))
+        seq_index = SeqIO.index(tmpfasta, 'fasta')
+        # Now parse through the bamfile and get average depth for each of the sequences.
+        with open('depths.csv', 'w') as f:
+            f.write('GC,Depth\n')
+        bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
+        for gene_name in gene_names:
+            # Need to break our gene up into 100 bp windows. Unless the gene we're looking at happens to be a multiple
+            # of 100 in terms of length, this won't quite work. To avoid super small sample sizes that could mess up
+            # our GC correction, set our last window to be the last 100 bases of the gene.
+            # Example: for a gene of length 450, windows go from base 1-100, 101-200, 201-300, 301-400, and 351-450
+            # Does mean we end up oversampling some bases, but seems to me to be better than the alternative of having
+            # really short windows with potentially extremely biased GC content/depths
+            gene_length = len(seq_index[gene_name].seq)
+            windows = generate_windows(gene_length, window_size=100)
+            for window in windows:
+                total_depth = 0
+                bases = 0
+                gc_bases = 0
+                start_base, end_base = window
+                for column in bamfile.pileup(contig=gene_name, start=start_base, end=end_base,
+                                             stepper='samtools', ignore_orphans=False,
+                                             fastafile=pysam.FastaFile(gene_fasta),
+                                             min_base_quality=0):
+                    ref_base = seq_index[gene_name].seq[column.reference_pos]
+                    if ref_base.upper() == 'G' or ref_base.upper() == 'C':
+                        gc_bases += 1
+                    bases += 1
+                    total_depth += column.nsegments
+                try:
+                    depth = total_depth/bases
+                    gc_content = round(100*gc_bases/bases)
+                    if gc_content in gc_dict:
+                        gc_dict[gc_content].append(depth)
+                    else:
+                        gc_dict[gc_content] = [depth]
+                    depths.append(depth)
+                    with open('depths.csv', 'a+') as f:
+                        f.write('{},{}\n'.format(gc_content, depth))
+                except ZeroDivisionError:
+                    pass
+        bamfile.close()
+    return depths, gc_dict
+
+
+def generate_windows(gene_length, window_size=100):
+    windows = list()  # This will be a list of tuples, where each tuple will be start coordinate and end coordinate
+    current_position = 0
+    while current_position < gene_length:
+        windows.append((current_position, current_position + window_size - 1))
+        current_position += window_size
+    windows.pop()
+    # Pysam uses zero based coordinates, so need the -1 so we don't overshoot end of gene
+    windows.append((gene_length - window_size - 1, gene_length - 1))
+    return windows
 
 
 def check_dependencies():
