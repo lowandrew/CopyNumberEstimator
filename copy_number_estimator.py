@@ -191,6 +191,11 @@ def main():
                                gc_dict=gc_dict)
     else:
         avg, std, gc_dict = db_check
+        # SQLite returns a bytes string for gc_dict. Fix that.
+        gc_dict = json.loads(gc_dict.decode('utf-8'))
+        # Also, keys in the dictionary became strings, so fix that too.
+        for percent in gc_dict:
+            gc_dict[int(percent)] = gc_dict.pop(percent)
     # Now find out if our gene of interest is outside our distribution.
     gene_names = list()
     for s in SeqIO.parse(args.gene_fasta_file, 'fasta'):
