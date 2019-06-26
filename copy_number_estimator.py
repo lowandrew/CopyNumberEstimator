@@ -151,7 +151,38 @@ def main():
     6) Optionally, can also do a search for minor variants that correspond to multiple alleles of a gene being present
     in a genome.
     """
-    # TODO: Implement GC correction on depth calcuations!
+    # Still have a ludicrous number of TODOs before this is anywhere near production ready. Rough list of things
+    # is below:
+
+    # Lots to do on single copy genes we use to estimate what depth should be. Need to (ideally) get a set of universal
+    # single copy nucleotide genes that aren't rMLST genes so we don't run into licensing issues, get these stored
+    # somewhere that makes sense instead of hardcoding the path, find a better way than KMA to determine allele for each
+    # gene (this doesn't have to be an exact solution, as long as it's not so far off that reads won't align well).
+
+    # Output formatting: Need to decide what output reports will actually look like and then do that instead of having
+    # information put up as print statements here and there
+
+    # Add more command line options/make the ones we have do something: threads and pvalue don't do anything right now,
+    # the database location option should be set to a sensible default, and more options will almost certainly come up.
+    # Should also probably get this set up as one main command with subparsers - at the very least one for running copy
+    # number estimation and another for any database manipulations that one might have. Should also have one for
+    # downloading/updating databases of single copy genes once I figure out what genes we're actually going to use.
+
+    # Lots of code right now is hilariously inefficent - for example, bam files are getting created multiple times
+    # instead of saving one copy and re-parsing it later. Also, option should get added to save the bam/other potential
+    # intermediate files that get created to somewhere instead of having them vanish from the face of the earth forever
+    # as soon as the leave the scope of the tempdir.
+
+    # Alleles selected for each gene are currently written to hardcoded genes_and_stuff.fasta. Set this to a reasonable
+    # default instead.
+
+    # No way to call this from within python right now, only available as CLI. Make some sort of method so other scripts
+    # can import and call from within python
+
+    # Lots of places need lots more logging statements.
+
+    # At some point, turn this into an actual package instead of just having it as a script.
+
     if check_dependencies() is False:
         logging.error('Some necessary dependencies not found. Exiting..')
         quit(code=1)
