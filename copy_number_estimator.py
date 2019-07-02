@@ -4,6 +4,7 @@ from scipy.stats import norm
 import multiprocessing
 from Bio import SeqIO
 import numpy as np
+import subprocess
 import tempfile
 import argparse
 import sqlite3
@@ -13,6 +14,22 @@ import pysam
 import json
 import glob
 import os
+
+
+def run_cmd(cmd):
+    """
+    Runs a command using subprocess, and returns both the stdout and stderr from that command
+    If exit code from command is non-zero, raises subproess.CalledProcessError
+    :param cmd: command to run as a string, as it would be called on the command line
+    :return: out, err: Strings that are the stdout and stderr from the command called.
+    """
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = p.communicate()
+    out = out.decode('utf-8')
+    err = err.decode('utf-8')
+    if p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd=cmd)
+    return out, err
 
 
 # Methods for putting JSON into/out of our sqlite database.
@@ -46,6 +63,10 @@ def get_args():
                         type=str,
                         required=True,
                         help='Path to FASTA-formatted file containing your gene (or genes?) of interest.')
+    parser.add_argument('-a', '--assembly',
+                        type=str,
+                        help='If you have an assembly for your genome of interest, specify it here. If you do not have '
+                             'an assembly, a quick and dirty assembly will be created with SKESA.')
     parser.add_argument('-p', '--p_value',
                         default=0.05,
                         type=float,
@@ -111,6 +132,20 @@ def get_copy_of_gene(forward_reads, reverse_reads, multigene_fasta):
                 return s
 
 
+def quick_and_dirty_assembly(forward_reads, reverse_reads, output_assembly):
+    # Some explanation on this: All we want to do with our output assembly is run a quick BLAST to get the locations
+    # of some (or hopefully all) of our universal single copy genes. Doesn't matter if our assembly is generally not
+    # particularly good as long as those genes get assembled. Parameters for quick assembly from: https://github.com/ncbi/SKESA/issues/11
+    # TODO: Investigate kmer size. rm
+    cmd = 'skesa --fastq {forward_reads} --fastq {reverse_reads} --steps 1 --kmer 99 --vector_percent 1 ' \
+          '--contigs_out {output_assembly}'.format(forward_reads=forward_reads,
+                                                   reverse_reads=reverse_reads,
+                                                   output_assembly=output_assembly)
+    out, err = run_cmd(cmd)
+    logging.info(out)
+    logging.info(err)
+
+
 def main():
     logging.basicConfig(format='\033[92m \033[1m %(asctime)s \033[0m %(message)s ',
                         level=logging.INFO,
@@ -168,7 +203,7 @@ def main():
     # number estimation and another for any database manipulations that one might have. Should also have one for
     # downloading/updating databases of single copy genes once I figure out what genes we're actually going to use.
 
-    # Lots of code right now is hilariously inefficent - for example, bam files are getting created multiple times
+    # Lots of code right now is hilariously inefficient - for example, bam files are getting created multiple times
     # instead of saving one copy and re-parsing it later. Also, option should get added to save the bam/other potential
     # intermediate files that get created to somewhere instead of having them vanish from the face of the earth forever
     # as soon as the leave the scope of the tempdir.
@@ -191,9 +226,35 @@ def main():
     db_check = check_for_sample_in_database(sample_name=sample_name,
                                             db_name=args.database)
     if db_check is False:
-        ref_fastas = glob.glob('single_copy_genes/*.fasta')
+        ref_fastas = glob.glob('busco_genes/*.fasta')
         gene_names = list()
         sequences = list()
+        # First, create quick and dirty assembly if user didn't provide one.
+        if args.assembly is None:
+            assembly_to_use = 'quick_assembly.fasta'
+            quick_and_dirty_assembly(args.forward_reads, args.reverse_reads, assembly_to_use)
+        else:
+            assembly_to_use = args.assembly
+
+        logging.info('Finding single copy genes...')
+        # Now find location of each of our single copy conserved genes and extract the nucleotide sequences.
+        for ref_fasta in ref_fastas:
+            # Now make a diamond db out of our ref (If we don't already have one)
+            db_name = os.path.split(ref_fasta)[1].replace('.fasta', '')
+            db_name = os.path.join('busco_genes', db_name)
+            if not os.path.isfile(db_name):
+                cmd = 'diamond makedb --db {db_name} --in {ref_fasta}'.format(db_name=db_name,
+                                                                              ref_fasta=ref_fasta)
+                run_cmd(cmd)
+            logging.info(ref_fasta)
+            cmd = 'diamond blastx --query {assembly} --db {db_name} -o test.tsv'.format(assembly=assembly_to_use,
+                                                                                        db_name=db_name)
+            run_cmd(cmd)
+            # Parse the BLAST-ish report that diamond gives out to extract nucleotide sequence for each conserved
+            # single copy gene. When we have a good hit, extract nucleotides for that region, and put them somewhere.
+
+        quit()  # Debug quit, TODO: Remove me.
+
         for fasta in ref_fastas:
             s = get_copy_of_gene(args.forward_reads, args.reverse_reads, fasta)
             gene_names.append(s.id)
@@ -525,7 +586,7 @@ def generate_windows(gene_length, window_size=100):
 def check_dependencies():
     logging.info('Checking for external dependencies.')
     all_dependencies_found = True
-    dependencies = ['kma', 'bowtie2', 'bowtie2-build']
+    dependencies = ['skesa', 'bowtie2', 'bowtie2-build', 'diamond']
     for dependency in dependencies:
         if shutil.which(dependency) is None:
             all_dependencies_found = False
