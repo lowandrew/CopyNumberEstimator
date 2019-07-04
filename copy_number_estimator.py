@@ -70,20 +70,24 @@ def get_args():
     parser.add_argument('-p', '--p_value',
                         default=0.05,
                         type=float,
-                        help='P-value to report on. NOT YET IMPLEMENTED.')
+                        help='P-value to report on.')
     parser.add_argument('-t', '--threads',
                         default=multiprocessing.cpu_count(),
                         type=int,
                         help='Number of threads to run analysis on. NOT YET IMPLEMENTED.')
-    parser.add_argument('--multiple_test_correction',
-                        default=False,
-                        action='store_true',
-                        help='Add this flag to do multiple test correction if you have multiple genes. NOT YET IMPLEMENTED')
     # TODO: Store this db someplace better by default.
     parser.add_argument('--database',
                         default='test_db',
                         type=str,
                         help='Database to store some stuff in.')
+    parser.add_argument('-s', '--single_copy_gene_folder',
+                        type=str,
+                        required=True,
+                        help='Path to folder that contains single copy genes. Must have a .fasta extension.')
+    parser.add_argument('-o', '--output_report',
+                        type=str,
+                        default='copy_number_report.csv',
+                        help='CSV file to store your output in.')
     return parser.parse_args()
 
 
@@ -142,8 +146,6 @@ def quick_and_dirty_assembly(forward_reads, reverse_reads, output_assembly):
                                                    reverse_reads=reverse_reads,
                                                    output_assembly=output_assembly)
     out, err = run_cmd(cmd)
-    logging.info(out)
-    logging.info(err)
 
 
 def main():
@@ -189,15 +191,6 @@ def main():
     # Still have a ludicrous number of TODOs before this is anywhere near production ready. Rough list of things
     # is below:
 
-    # Lots to do on single copy genes we use to estimate what depth should be. Need to (ideally) get a set of universal
-    # single copy nucleotide genes that aren't rMLST genes so we don't run into licensing issues, get these stored
-    # somewhere that makes sense instead of hardcoding the path, find a better way than KMA to determine allele for each
-    # gene (this doesn't have to be an exact solution, as long as it's not so far off that reads won't align well).
-    # Update July 2/2019 - should be able to move to using BUSCOs, just need to create assemblies (can be super quick
-    # and dirty) for isolates if user doesn't provide, and then BLAST (or diamond instead since way faster) the
-    # conserved proteins against the assemblies to pull out nucleotide sequence for each conserved gene so that the rest
-    # of the program can continue as before. Will also need to make a BUSCO downloader at some point.
-
     # Output formatting: Need to decide what output reports will actually look like and then do that instead of having
     # information put up as print statements here and there
 
@@ -221,116 +214,136 @@ def main():
     # Lots of places need lots more logging statements.
 
     # At some point, turn this into an actual package instead of just having it as a script.
+    make_copy_number_report(forward_reads=args.forward_reads,
+                            reverse_reads=args.reverse_reads,
+                            genes_of_interest=args.gene_fasta_file,
+                            single_copy_gene_folder=args.single_copy_gene_folder,
+                            assembly=args.assembly,
+                            pvalue=args.p_value,
+                            database=args.database)
 
+
+def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, single_copy_gene_folder,
+                            assembly=None, pvalue=0.05, threads=1, database='test_db', stdev_multiplier=1.1,
+                            max_copy_number=10, read_identifier='_R1', report_file='copy_number_report.csv'):
     if check_dependencies() is False:
         logging.error('Some necessary dependencies not found. Exiting..')
         quit(code=1)
 
-    sample_name = os.path.split(args.forward_reads)[1].split('_R1')[0]
-    db_check = check_for_sample_in_database(sample_name=sample_name,
-                                            db_name=args.database)
-    if db_check is False:
-        ref_fastas = glob.glob('busco_genes/*.fasta')
-        gene_names = list()
-        # First, create quick and dirty assembly if user didn't provide one.
-        if args.assembly is None:
-            assembly_to_use = 'quick_assembly.fasta'
-            quick_and_dirty_assembly(args.forward_reads, args.reverse_reads, assembly_to_use)
-        else:
-            assembly_to_use = args.assembly
+    # Assign a name to the sample
+    sample_name = os.path.split(forward_reads)[1].split(read_identifier)[0]
+    db_check = check_for_sample_in_database(sample_name=sample_name, db_name=database)
 
-        logging.info('Finding single copy genes...')
-        # Now find location of each of our single copy conserved genes and extract the nucleotide sequences.
-        conserved_count = 0
-        if os.path.isfile('genes_and_stuff.fasta'):
-            os.remove('genes_and_stuff.fasta')
-        for ref_fasta in ref_fastas:
-            # Now make a diamond db out of our ref (If we don't already have one)
-            db_name = os.path.split(ref_fasta)[1].replace('.fasta', '')
-            db_name = os.path.join('busco_genes', db_name)
-            if not os.path.isfile(db_name):
-                cmd = 'diamond makedb --db {db_name} --in {ref_fasta}'.format(db_name=db_name,
-                                                                              ref_fasta=ref_fasta)
-                run_cmd(cmd)
-            logging.info(ref_fasta)
-            cmd = 'diamond blastx --query {assembly} --db {db_name} -o test.tsv'.format(assembly=assembly_to_use,
-                                                                                        db_name=db_name)
-            run_cmd(cmd)
-            # Parse the BLAST-ish report that diamond gives out to extract nucleotide sequence for each conserved
-            # single copy gene. When we have a good hit, extract nucleotides for that region, and put them somewhere.
-
+    with tempfile.TemporaryDirectory() as tmpdir:
+        if db_check is False:
+            if assembly is None:
+                logging.info('No assembly provided. Creating rough assembly...')
+                assembly_to_use = os.path.join(tmpdir, 'assembly.fasta')
+                quick_and_dirty_assembly(forward_reads, reverse_reads, assembly_to_use)
+            else:
+                shutil.copy(assembly, tmpdir)
+                assembly_to_use = os.path.join(tmpdir, os.path.split(assembly)[1])
             seq_index = SeqIO.index(assembly_to_use, 'fasta')
-            with open('test.tsv') as f:
-                lines = f.readlines()
-            with open('genes_and_stuff.fasta', 'a+') as f:
-                if len(lines) > 0:
-                    x = lines[0].split()
-                    contig = x[0]
-                    start_pos = int(x[6])
-                    end_pos = int(x[7])
-                    percent_id = float(x[2])
-                    if percent_id > 95:
-                        conserved_count += 1
-                        f.write('>gene_{}\n'.format(conserved_count))
-                        gene_names.append('gene_{}'.format(conserved_count))
-                        if start_pos < end_pos:
-                            f.write('{}\n'.format(seq_index[contig].seq[start_pos:end_pos]))
-                        else:
-                            f.write('{}\n'.format(seq_index[contig].seq[end_pos:start_pos]))
+            conserved_count = 0
+            # Now time to find single copy genes in our assembly!
+            logging.info('Finding single copy genes...')
+            single_copy_gene_file = os.path.join(tmpdir, 'single_copy_genes.fasta')
+            gene_names = list()
+            for fasta_file in sorted(glob.glob(os.path.join(single_copy_gene_folder, '*.fasta'))):
+                db_name = fasta_file.replace('.fasta', '')
+                # Create diamond database if it doesn't exist already.
+                if not os.path.isfile(db_name):
+                    cmd = 'diamond makedb --db {db_name} --in {ref_fasta}'.format(db_name=db_name,
+                                                                                  ref_fasta=fasta_file)
+                    run_cmd(cmd)
+                diamond_report = os.path.join(tmpdir, 'diamond.tsv')
+                cmd = 'diamond blastx --query {assembly} --db {db_name} -o {outfile}'.format(assembly=assembly_to_use,
+                                                                                             db_name=db_name,
+                                                                                             outfile=diamond_report)
+                run_cmd(cmd)
+                with open(diamond_report) as f:
+                    lines = f.readlines()
+                with open(single_copy_gene_file, 'a+') as f:
+                    if len(lines) > 0:
+                        x = lines[0].split()
+                        contig = x[0]
+                        start_pos = int(x[6])
+                        end_pos = int(x[7])
+                        percent_id = float(x[2])
+                        if percent_id > 95:
+                            conserved_count += 1
+                            f.write('>gene_{}\n'.format(conserved_count))
+                            gene_names.append('gene_{}'.format(conserved_count))
+                            if start_pos < end_pos:
+                                f.write('{}\n'.format(seq_index[contig].seq[start_pos:end_pos]))
+                            else:
+                                f.write('{}\n'.format(seq_index[contig].seq[end_pos:start_pos]))
+            bam = os.path.join(tmpdir, 'sorted_bam.bam')
+            logging.info('Calculating depths for single copy genes...')
+            depths, gc_dict = get_depths(forward_reads, reverse_reads, single_copy_gene_file, gene_names, out_bam=bam)
+            logging.info('Correcting for GC content...')
+            corrected_depths = get_corrected_depths(forward_reads, reverse_reads, single_copy_gene_file,
+                                                    gene_names, gc_dict, depths, bam=bam)
+            uncorr_avg, uncorr_std = norm.fit(np.array(depths))
+            logging.info('UNCORRECTED STATS:')
+            logging.info('Median depth: {}'.format(np.median(depths)))
+            logging.info('Normal distribution mean: {}'.format(uncorr_avg))
+            logging.info('Normal distribution stdev: {}'.format(uncorr_std))
 
-        depths, gc_dict = get_depths(args.forward_reads, args.reverse_reads, 'genes_and_stuff.fasta', gene_names)
-        # TODO: Currently re-creating the BAM file in this step, which is a fantastic waste of time.
-        #  Make it so if I provide a BAM to this method we don't recalculate the BAM file.
-        corrected_depths = get_corrected_depths(args.forward_reads, args.reverse_reads, 'genes_and_stuff.fasta',
-                                                gene_names, gc_dict, depths)
-        uncorr_avg, uncorr_std = norm.fit(np.array(depths))
-        logging.info('UNCORRECTED STATS:')
-        logging.info('Median depth: {}'.format(np.median(depths)))
-        logging.info('Normal distribution mean: {}'.format(uncorr_avg))
-        logging.info('Normal distribution stdev: {}'.format(uncorr_std))
+            logging.info('\nGC CORRECTED STATS:')
+            avg, std = norm.fit(np.array(corrected_depths))
+            logging.info('Median depth: {}'.format(np.median(corrected_depths)))
+            logging.info('Normal distribution mean: {}'.format(avg))
+            logging.info('Normal distribution stdev: {}'.format(std))
+            add_sample_to_database(sample_name=sample_name,
+                                   avgdepth=avg,
+                                   stdev=std,
+                                   db_name=database,
+                                   gc_dict=gc_dict)
+        else:
+            avg, std, gc_dict = db_check
+            # SQLite returns a bytes string for gc_dict. Fix that.
+            gc_dict = json.loads(gc_dict.decode('utf-8'))
+            # Also, keys in the dictionary became strings, so fix that too.
+            for percent in gc_dict:
+                gc_dict[int(percent)] = gc_dict.pop(percent)
 
-        logging.info('\nGC CORRECTED STATS:')
-        avg, std = norm.fit(np.array(corrected_depths))
-        logging.info('Median depth: {}'.format(np.median(corrected_depths)))
-        logging.info('Normal distribution mean: {}'.format(avg))
-        logging.info('Normal distribution stdev: {}'.format(std))
-        add_sample_to_database(sample_name=sample_name,
-                               avgdepth=avg,
-                               stdev=std,
-                               db_name=args.database,
-                               gc_dict=gc_dict)
-    else:
-        avg, std, gc_dict = db_check
-        # SQLite returns a bytes string for gc_dict. Fix that.
-        gc_dict = json.loads(gc_dict.decode('utf-8'))
-        # Also, keys in the dictionary became strings, so fix that too.
-        for percent in gc_dict:
-            gc_dict[int(percent)] = gc_dict.pop(percent)
-    # Now find out if our gene of interest is outside our distribution.
-    gene_names = list()
-    for s in SeqIO.parse(args.gene_fasta_file, 'fasta'):
-        gene_names.append(s.id)
-    depths = get_corrected_depths_per_gene(args.forward_reads, args.reverse_reads, args.gene_fasta_file, gene_names, gc_dict,
-                                           avg)
-    logging.info('Average:{}\nStdev:{}\n'.format(avg, std))
-    print('Gene,Depth,MostLikely,1Copy,2Copy,3Copy,4Copy,5Copy,6Copy,7Copy,8Copy,9Copy,10Copy')
-    for gene_name in depths:
-        depth = depths[gene_name]
-        copy_dict = find_most_likely_copy_number(single_copy_mean=avg,
-                                                 single_copy_stdev=std,
-                                                 max_copy_number=10,
-                                                 depth=depth)
-        outstr = '{},{},'.format(gene_name, depth)
-        highest_value = 0
-        most_likely = 'NA'
-        for i in range(1, 11):
-            if copy_dict[i] > highest_value:
-                most_likely = i
-                highest_value = copy_dict[i]
-        outstr += '{},'.format(most_likely)
-        for i in range(1, 11):
-            outstr += '{},'.format(copy_dict[i])
-        print(outstr)
+        gene_names = list()
+        for s in SeqIO.parse(genes_of_interest, 'fasta'):
+            gene_names.append(s.id)
+        logging.info('Calculating depths for target genes...')
+        depths = get_corrected_depths_per_gene(forward_reads, reverse_reads, genes_of_interest, gene_names, gc_dict, avg)
+        with open(report_file, 'w') as f:
+            f.write('Gene,Depth,PossibleCopyNumbers,SingleCopyDepth,SingleCopyStdev,StdevMultiplier\n')
+            for gene_name in depths:
+                depth = depths[gene_name]
+                possible_numbers = find_possible_copy_numbers(single_copy_mean=avg,
+                                                              single_copy_stdev=std,
+                                                              stdev_multiplier=stdev_multiplier,
+                                                              max_copy_number=max_copy_number,
+                                                              gene_depth=depth,
+                                                              pval_cutoff=pvalue)
+                f.write('{},{},{},{},{},{}\n'.format(gene_name,
+                                                     depth,
+                                                     ';'.join(possible_numbers),
+                                                     avg,
+                                                     std,
+                                                     stdev_multiplier))
+        logging.info('Done! Thanks for using CopyNumberEstimator.')
+
+def find_possible_copy_numbers(single_copy_mean, single_copy_stdev, stdev_multiplier, max_copy_number, gene_depth, pval_cutoff):
+    possible_copy_numbers = list()
+    current_stdev = single_copy_stdev
+    for i in range(1, max_copy_number + 1):
+        prob = norm.cdf(gene_depth, single_copy_mean * i, current_stdev)
+        if prob <= 0.5:
+            p = 2 * prob
+        else:
+            p = (1 - prob) * 2
+        if p >= pval_cutoff:
+            possible_copy_numbers.append(str(i))
+        current_stdev = current_stdev * stdev_multiplier
+    return possible_copy_numbers
 
 
 def check_for_sample_in_database(sample_name, db_name):
@@ -368,7 +381,7 @@ def add_sample_to_database(sample_name, avgdepth, stdev, db_name, gc_dict):
     conn.close()
 
 
-def find_most_likely_copy_number(single_copy_mean, single_copy_stdev, max_copy_number, depth):
+def find_most_likely_copy_number(single_copy_mean, single_copy_stdev, max_copy_number, depth, stdev_multiplier=1.1):
     copy_number_dict = dict()
     current_mean = single_copy_mean
     current_stdev = single_copy_stdev
@@ -382,7 +395,7 @@ def find_most_likely_copy_number(single_copy_mean, single_copy_stdev, max_copy_n
         current_mean += single_copy_mean
         # Add 10 percent to current standard deviation so distributions get fatter as we get more copy number.
         # This is definitely my intuition on how things should work, but needs to actually be modeled at some point.
-        current_stdev = current_stdev * 1.1
+        current_stdev = current_stdev * stdev_multiplier
     return copy_number_dict
 
 
@@ -390,26 +403,29 @@ def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene
     corrected_depths = dict()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpfasta = os.path.join(tmpdir, gene_fasta)
-        shutil.copy(gene_fasta, tmpfasta)
+        try:
+            shutil.copy(gene_fasta, tmpfasta)
+        except shutil.SameFileError:
+            pass
         outbam = os.path.join(tmpdir, 'out.bam')
         # Make our bowtie2 index
         bt2_index = os.path.join(tmpdir, 'bowtie_db')
         cmd = 'bowtie2-build {} {}'.format(tmpfasta, bt2_index)
-        os.system(cmd)
+        run_cmd(cmd)
         # Now align our reads against created database. Use very sensitive local bowtie settings so we can be
         # relatively sure we've gotten everything.
         cmd = 'bowtie2 -p 12 --very-sensitive-local -x {} -1 {} -2 {} | samtools view -bS > {}'.format(bt2_index,
                                                                                                        forward_reads,
                                                                                                        reverse_reads,
                                                                                                        outbam)
-        os.system(cmd)
+        run_cmd(cmd)
         # Sort and index created bamfile so we can parse it
         sorted_bam = os.path.join(tmpdir, 'out_sorted.bam')
         cmd = 'samtools sort {} > {}'.format(outbam, sorted_bam)
-        os.system(cmd)
+        run_cmd(cmd)
         cmd = 'samtools index {}'.format(sorted_bam)
-        os.system(cmd)
-        os.system('samtools faidx {}'.format(gene_fasta))
+        run_cmd(cmd)
+        run_cmd('samtools faidx {}'.format(gene_fasta))
         seq_index = SeqIO.index(tmpfasta, 'fasta')
         bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
         for gene_name in gene_names:
@@ -451,32 +467,41 @@ def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene
     return corrected_depths
 
 
-def get_corrected_depths(forward_reads, reverse_reads, gene_fasta, gene_names, gc_dict, uncorrected_depths):
+def get_corrected_depths(forward_reads, reverse_reads, gene_fasta, gene_names, gc_dict, uncorrected_depths, bam=None):
     corrected_depths = list()
     uncorrected_median = np.median(uncorrected_depths)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpfasta = os.path.join(tmpdir, gene_fasta)
-        shutil.copy(gene_fasta, tmpfasta)
-        outbam = os.path.join(tmpdir, 'out.bam')
-        # Make our bowtie2 index
-        bt2_index = os.path.join(tmpdir, 'bowtie_db')
-        cmd = 'bowtie2-build {} {}'.format(tmpfasta, bt2_index)
-        os.system(cmd)
-        # Now align our reads against created database. Use very sensitive local bowtie settings so we can be
-        # relatively sure we've gotten everything.
-        cmd = 'bowtie2 -p 12 --very-sensitive-local -x {} -1 {} -2 {} | samtools view -bS > {}'.format(bt2_index,
-                                                                                                       forward_reads,
-                                                                                                       reverse_reads,
-                                                                                                       outbam)
-        os.system(cmd)
-        # Sort and index created bamfile so we can parse it
-        sorted_bam = os.path.join(tmpdir, 'out_sorted.bam')
-        cmd = 'samtools sort {} > {}'.format(outbam, sorted_bam)
-        os.system(cmd)
-        cmd = 'samtools index {}'.format(sorted_bam)
-        os.system(cmd)
-        os.system('samtools faidx {}'.format(gene_fasta))
+        try:
+            shutil.copy(gene_fasta, tmpfasta)
+        except shutil.SameFileError:
+            pass
         seq_index = SeqIO.index(tmpfasta, 'fasta')
+        if bam is None:
+            outbam = os.path.join(tmpdir, 'out.bam')
+            # Make our bowtie2 index
+            bt2_index = os.path.join(tmpdir, 'bowtie_db')
+            cmd = 'bowtie2-build {} {}'.format(tmpfasta, bt2_index)
+            run_cmd(cmd)
+            # Now align our reads against created database. Use very sensitive local bowtie settings so we can be
+            # relatively sure we've gotten everything.
+            cmd = 'bowtie2 -p 12 --very-sensitive-local -x {} -1 {} -2 {} | samtools view -bS > {}'.format(bt2_index,
+                                                                                                           forward_reads,
+                                                                                                           reverse_reads,
+                                                                                                           outbam)
+            run_cmd(cmd)
+            # Sort and index created bamfile so we can parse it
+            sorted_bam = os.path.join(tmpdir, 'out_sorted.bam')
+            cmd = 'samtools sort {} > {}'.format(outbam, sorted_bam)
+            run_cmd(cmd)
+            cmd = 'samtools index {}'.format(sorted_bam)
+            run_cmd(cmd)
+            run_cmd('samtools faidx {}'.format(gene_fasta))
+        else:
+            sorted_bam = bam
+            run_cmd('samtools faidx {}'.format(gene_fasta))
+            cmd = 'samtools index {}'.format(sorted_bam)
+            run_cmd(cmd)
         bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
         for gene_name in gene_names:
             # Need to break our gene up into 100 bp windows. Unless the gene we're looking at happens to be a multiple
@@ -520,35 +545,35 @@ def get_corrected_depths(forward_reads, reverse_reads, gene_fasta, gene_names, g
     return corrected_depths
 
 
-def get_depths(forward_reads, reverse_reads, gene_fasta, gene_names):
+def get_depths(forward_reads, reverse_reads, gene_fasta, gene_names, out_bam=None):
     depths = list()
     gc_dict = dict()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpfasta = os.path.join(tmpdir, gene_fasta)
-        shutil.copy(gene_fasta, tmpfasta)
+        try:
+            shutil.copy(gene_fasta, tmpfasta)
+        except shutil.SameFileError:
+            pass
         outbam = os.path.join(tmpdir, 'out.bam')
         # Make our bowtie2 index
         bt2_index = os.path.join(tmpdir, 'bowtie_db')
         cmd = 'bowtie2-build {} {}'.format(tmpfasta, bt2_index)
-        os.system(cmd)
+        run_cmd(cmd)
         # Now align our reads against created database. Use very sensitive local bowtie settings so we can be
         # relatively sure we've gotten everything.
         cmd = 'bowtie2 -p 12 --very-sensitive-local -x {} -1 {} -2 {} | samtools view -bS > {}'.format(bt2_index,
                                                                                                        forward_reads,
                                                                                                        reverse_reads,
                                                                                                        outbam)
-        os.system(cmd)
+        run_cmd(cmd)
         # Sort and index created bamfile so we can parse it
         sorted_bam = os.path.join(tmpdir, 'out_sorted.bam')
         cmd = 'samtools sort {} > {}'.format(outbam, sorted_bam)
-        os.system(cmd)
+        run_cmd(cmd)
         cmd = 'samtools index {}'.format(sorted_bam)
-        os.system(cmd)
-        os.system('samtools faidx {}'.format(gene_fasta))
+        run_cmd(cmd)
+        run_cmd('samtools faidx {}'.format(gene_fasta))
         seq_index = SeqIO.index(tmpfasta, 'fasta')
-        # Now parse through the bamfile and get average depth for each of the sequences.
-        with open('depths.csv', 'w') as f:
-            f.write('GC,Depth\n')
         bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
         for gene_name in gene_names:
             # Need to break our gene up into 100 bp windows. Unless the gene we're looking at happens to be a multiple
@@ -581,16 +606,21 @@ def get_depths(forward_reads, reverse_reads, gene_fasta, gene_names):
                     else:
                         gc_dict[gc_content] = [depth]
                     depths.append(depth)
-                    with open('depths.csv', 'a+') as f:
-                        f.write('{},{}\n'.format(gc_content, depth))
                 except ZeroDivisionError:
                     pass
         bamfile.close()
+        if out_bam is not None:
+            try:
+                shutil.copy(sorted_bam, out_bam)
+            except shutil.SameFileError:
+                pass
     return depths, gc_dict
 
 
 def generate_windows(gene_length, window_size=100):
     windows = list()  # This will be a list of tuples, where each tuple will be start coordinate and end coordinate
+    if gene_length < window_size:
+        return windows
     current_position = 0
     while current_position < gene_length:
         windows.append((current_position, current_position + window_size - 1))

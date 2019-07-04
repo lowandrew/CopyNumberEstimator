@@ -24,26 +24,30 @@ def download_ortho_db_fasta(ortho_db_id):
     return response.content
 
 
-if __name__ == '__main__':
-    logging.basicConfig(format='\033[92m \033[1m %(asctime)s \033[0m %(message)s ',
-                    level=logging.INFO,
-                    datefmt='%Y-%m-%d %H:%M:%S')
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--output_directory',
-                        type=str,
-                        required=True,  # TODO: Make this default to an env var or something.
-                        help='Folder to store universal(ish) single copy(ish) genes. Must not already exist.')
-    args = parser.parse_args()
-    if os.path.isdir(args.output_directory):
+def download_single_copy_genes(output_folder):
+    if os.path.isdir(output_folder):
         raise FileExistsError('Output folder specified ({}) already exists. Please choose a folder that does not '
-                              'already exist.'.format(args.output_directory))
-    os.makedirs(args.output_directory)
+                              'already exist.'.format(output_folder))
+    os.makedirs(output_folder)
     ortho_db_ids = get_list_of_orthodb_ids()
     logging.info('Found {} genes to download.'.format(len(ortho_db_ids)))
     downloaded_count = 1
     for odbid in ortho_db_ids:
         logging.info('Downloading gene {} of {}'.format(downloaded_count, len(ortho_db_ids)))
         fasta_content = download_ortho_db_fasta(odbid)
-        with open(os.path.join(args.output_directory, odbid + '.fasta'), 'w') as f:
+        with open(os.path.join(output_folder, odbid + '.fasta'), 'w') as f:
             f.write(fasta_content)
         downloaded_count += 1
+
+
+if __name__ == '__main__':
+    logging.basicConfig(format='\033[92m \033[1m %(asctime)s \033[0m %(message)s ',
+                        level=logging.INFO,
+                        datefmt='%Y-%m-%d %H:%M:%S')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-o', '--output_directory',
+                        type=str,
+                        required=True,  # TODO: Make this default to an env var or something.
+                        help='Folder to store universal(ish) single copy(ish) genes. Must not already exist.')
+    args = parser.parse_args()
+    download_single_copy_genes(output_folder=args.output_directory)
