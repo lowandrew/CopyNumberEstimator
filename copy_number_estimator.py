@@ -136,7 +136,7 @@ def quick_and_dirty_assembly(forward_reads, reverse_reads, output_assembly):
     # Some explanation on this: All we want to do with our output assembly is run a quick BLAST to get the locations
     # of some (or hopefully all) of our universal single copy genes. Doesn't matter if our assembly is generally not
     # particularly good as long as those genes get assembled. Parameters for quick assembly from: https://github.com/ncbi/SKESA/issues/11
-    # TODO: Investigate kmer size. rm
+    # TODO: Investigate kmer size.
     cmd = 'skesa --fastq {forward_reads} --fastq {reverse_reads} --steps 1 --kmer 99 --vector_percent 1 ' \
           '--contigs_out {output_assembly}'.format(forward_reads=forward_reads,
                                                    reverse_reads=reverse_reads,
@@ -193,6 +193,10 @@ def main():
     # single copy nucleotide genes that aren't rMLST genes so we don't run into licensing issues, get these stored
     # somewhere that makes sense instead of hardcoding the path, find a better way than KMA to determine allele for each
     # gene (this doesn't have to be an exact solution, as long as it's not so far off that reads won't align well).
+    # Update July 2/2019 - should be able to move to using BUSCOs, just need to create assemblies (can be super quick
+    # and dirty) for isolates if user doesn't provide, and then BLAST (or diamond instead since way faster) the
+    # conserved proteins against the assemblies to pull out nucleotide sequence for each conserved gene so that the rest
+    # of the program can continue as before. Will also need to make a BUSCO downloader at some point.
 
     # Output formatting: Need to decide what output reports will actually look like and then do that instead of having
     # information put up as print statements here and there
@@ -228,7 +232,6 @@ def main():
     if db_check is False:
         ref_fastas = glob.glob('busco_genes/*.fasta')
         gene_names = list()
-        sequences = list()
         # First, create quick and dirty assembly if user didn't provide one.
         if args.assembly is None:
             assembly_to_use = 'quick_assembly.fasta'
@@ -238,6 +241,9 @@ def main():
 
         logging.info('Finding single copy genes...')
         # Now find location of each of our single copy conserved genes and extract the nucleotide sequences.
+        conserved_count = 0
+        if os.path.isfile('genes_and_stuff.fasta'):
+            os.remove('genes_and_stuff.fasta')
         for ref_fasta in ref_fastas:
             # Now make a diamond db out of our ref (If we don't already have one)
             db_name = os.path.split(ref_fasta)[1].replace('.fasta', '')
@@ -253,13 +259,25 @@ def main():
             # Parse the BLAST-ish report that diamond gives out to extract nucleotide sequence for each conserved
             # single copy gene. When we have a good hit, extract nucleotides for that region, and put them somewhere.
 
-        quit()  # Debug quit, TODO: Remove me.
+            seq_index = SeqIO.index(assembly_to_use, 'fasta')
+            with open('test.tsv') as f:
+                lines = f.readlines()
+            with open('genes_and_stuff.fasta', 'a+') as f:
+                if len(lines) > 0:
+                    x = lines[0].split()
+                    contig = x[0]
+                    start_pos = int(x[6])
+                    end_pos = int(x[7])
+                    percent_id = float(x[2])
+                    if percent_id > 95:
+                        conserved_count += 1
+                        f.write('>gene_{}\n'.format(conserved_count))
+                        gene_names.append('gene_{}'.format(conserved_count))
+                        if start_pos < end_pos:
+                            f.write('{}\n'.format(seq_index[contig].seq[start_pos:end_pos]))
+                        else:
+                            f.write('{}\n'.format(seq_index[contig].seq[end_pos:start_pos]))
 
-        for fasta in ref_fastas:
-            s = get_copy_of_gene(args.forward_reads, args.reverse_reads, fasta)
-            gene_names.append(s.id)
-            sequences.append(s)
-        SeqIO.write(sequences, 'genes_and_stuff.fasta', 'fasta')
         depths, gc_dict = get_depths(args.forward_reads, args.reverse_reads, 'genes_and_stuff.fasta', gene_names)
         # TODO: Currently re-creating the BAM file in this step, which is a fantastic waste of time.
         #  Make it so if I provide a BAM to this method we don't recalculate the BAM file.
@@ -586,7 +604,7 @@ def generate_windows(gene_length, window_size=100):
 def check_dependencies():
     logging.info('Checking for external dependencies.')
     all_dependencies_found = True
-    dependencies = ['skesa', 'bowtie2', 'bowtie2-build', 'diamond']
+    dependencies = ['skesa', 'bowtie2', 'bowtie2-build', 'diamond', 'samtools']
     for dependency in dependencies:
         if shutil.which(dependency) is None:
             all_dependencies_found = False
