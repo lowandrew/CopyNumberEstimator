@@ -11,10 +11,10 @@ def create_plot(mean, stdev, max_copy, stdev_multiplier, gene_depth, gene_name):
     for i in range(1, max_copy + 1):
         xticks.append(mean * i)
         samples = np.random.normal(loc=mean * i, scale=stdev, size=1000)
-        plt.hist(samples, alpha=0.5, label='{}X'.format(i))
+        plt.hist(samples, alpha=0.5, label='{}X'.format(i), bins=20)
         stdev *= stdev_multiplier
-    plt.plot([gene_depth, gene_depth], [0, 250], 'black', label=gene_name)
-    plt.legend()
+    plt.plot([gene_depth, gene_depth], [0, 125], 'black', label=gene_name)
+    # plt.legend()
     plt.xticks(xticks)
     plt.title('Copy Number for {}'.format(gene_name))
     plt.show()

@@ -36,7 +36,7 @@ def download_single_copy_genes(output_folder):
         logging.info('Downloading gene {} of {}'.format(downloaded_count, len(ortho_db_ids)))
         fasta_content = download_ortho_db_fasta(odbid)
         with open(os.path.join(output_folder, odbid + '.fasta'), 'w') as f:
-            f.write(fasta_content)
+            f.write(fasta_content.decode('utf-8'))
         downloaded_count += 1
 
 

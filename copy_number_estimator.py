@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from download_single_copy_genes import download_single_copy_genes
 from scipy.stats import norm
 import multiprocessing
 from Bio import SeqIO
@@ -75,14 +76,13 @@ def get_args():
                         default=multiprocessing.cpu_count(),
                         type=int,
                         help='Number of threads to run analysis on. NOT YET IMPLEMENTED.')
-    # TODO: Store this db someplace better by default.
     parser.add_argument('--database',
-                        default='test_db',
+                        default=os.environ.get('COPYNUMBERDB', os.path.expanduser('~/.CopyNumberDB')),
                         type=str,
                         help='Database to store some stuff in.')
     parser.add_argument('-s', '--single_copy_gene_folder',
                         type=str,
-                        required=True,
+                        default=os.environ.get('SINGLECOPYGENEFOLDER', os.path.expanduser('~/.SingleCopyGenes')),
                         help='Path to folder that contains single copy genes. Must have a .fasta extension.')
     parser.add_argument('-o', '--output_report',
                         type=str,
@@ -212,6 +212,9 @@ def main():
     # can import and call from within python
 
     # Lots of places need lots more logging statements.
+    if not os.path.isdir(args.single_copy_gene_folder):
+        logging.info('Single copy genes not found. Downloading them to {}'.format(args.single_copy_gene_folder))
+        download_single_copy_genes(args.single_copy_gene_folder)
 
     # At some point, turn this into an actual package instead of just having it as a script.
     make_copy_number_report(forward_reads=args.forward_reads,
@@ -220,7 +223,8 @@ def main():
                             single_copy_gene_folder=args.single_copy_gene_folder,
                             assembly=args.assembly,
                             pvalue=args.p_value,
-                            database=args.database)
+                            database=args.database,
+                            report_file=args.output_report)
 
 
 def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, single_copy_gene_folder,
@@ -331,6 +335,7 @@ def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, sin
                                                      stdev_multiplier))
         logging.info('Done! Thanks for using CopyNumberEstimator.')
 
+
 def find_possible_copy_numbers(single_copy_mean, single_copy_stdev, stdev_multiplier, max_copy_number, gene_depth, pval_cutoff):
     possible_copy_numbers = list()
     current_stdev = single_copy_stdev
@@ -429,6 +434,7 @@ def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene
         seq_index = SeqIO.index(tmpfasta, 'fasta')
         bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
         for gene_name in gene_names:
+            logging.info(gene_name)
             gene_window_depths = list()
             # Find out what depth is and put it into corrected_depths dictionary.
             gene_length = len(seq_index[gene_name].seq)
