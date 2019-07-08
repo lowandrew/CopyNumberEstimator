@@ -91,56 +91,12 @@ def get_args():
     return parser.parse_args()
 
 
-def find_variant_proportions(bamfile):
-    # Not sure we'll ever actually end up using this...
-    bamfile = pysam.AlignmentFile(bamfile, 'rb')
-    proportions_list = list()
-    for column in bamfile.pileup():
-        base_list = [0, 0, 0, 0]
-        for read in column.pileups:
-            if not read.is_del and not read.is_refskip:
-                if read.alignment.query_sequence[read.query_position] == 'A':
-                    base_list[0] += 1
-                if read.alignment.query_sequence[read.query_position] == 'C':
-                    base_list[1] += 1
-                if read.alignment.query_sequence[read.query_position] == 'T':
-                    base_list[2] += 1
-                if read.alignment.query_sequence[read.query_position] == 'G':
-                    base_list[3] += 1
-        proportion = max(base_list)/sum(base_list)
-        if 0.1 <= proportion <= 0.9:
-            proportions_list.append(proportion)
-    bamfile.close()
-    return np.array(proportions_list)
-
-
-def get_copy_of_gene(forward_reads, reverse_reads, multigene_fasta):
-    # Use KMA to figure out which allele of a gene is present in a set of reads.
-
-    # Create kma database if it doesn't exist already.
-    if not os.path.isfile(multigene_fasta.replace('.fasta', '_kma.name')):
-        cmd = 'kma index -i {} -o {}'.format(multigene_fasta, multigene_fasta.replace('.fasta', '_kma'))
-        os.system(cmd)
-    # Run KMA, writing results to a tmpdir as we go.
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cmd = 'kma -t 12 -ipe {} {} -t_db {} -o {}'.format(forward_reads, reverse_reads, multigene_fasta.replace('.fasta', '_kma'),
-                                                           os.path.join(tmpdir, 'kma_results'))
-        os.system(cmd)
-        # Parse the result file to find out what version of the gene we actually have present.
-        with open(os.path.join(tmpdir, 'kma_results.res')) as f:
-            lines = f.readlines()
-        gene_name = lines[1].split()[0]
-        # Probably use SeqIO.index here, should be faster than parsing through the whole file...
-        for s in SeqIO.parse(multigene_fasta, 'fasta'):
-            if s.id == gene_name:
-                return s
-
-
 def quick_and_dirty_assembly(forward_reads, reverse_reads, output_assembly):
     # Some explanation on this: All we want to do with our output assembly is run a quick BLAST to get the locations
     # of some (or hopefully all) of our universal single copy genes. Doesn't matter if our assembly is generally not
     # particularly good as long as those genes get assembled. Parameters for quick assembly from: https://github.com/ncbi/SKESA/issues/11
-    # TODO: Investigate kmer size.
+    # TODO: Investigate kmer size. 99 is likely too long for HiSeq data? Determine dynamically based on sampling a
+    #   few reads?
     cmd = 'skesa --fastq {forward_reads} --fastq {reverse_reads} --steps 1 --kmer 99 --vector_percent 1 ' \
           '--contigs_out {output_assembly}'.format(forward_reads=forward_reads,
                                                    reverse_reads=reverse_reads,
@@ -165,10 +121,6 @@ def main():
     with more copies will be bigger, but this should actually get backed up somehow if possible. Do some empirical
     testing to find out?
 
-    What distribution to fit depth of coverage to? This is definitely very important and should be thought about lots.
-    Extremely preliminary, but a normal distribution looks about right. Can then estimate mean and stdev, and then
-    get probability fairly easily.
-
     Implementation:
     0) For all of our conserved single copy genes, figure out which allele is actually present in our reads. Use KMA
     for this for now, but may need to find something better at some point. KMA has been more buggy than I'd like it
@@ -188,30 +140,6 @@ def main():
     6) Optionally, can also do a search for minor variants that correspond to multiple alleles of a gene being present
     in a genome.
     """
-    # Still have a ludicrous number of TODOs before this is anywhere near production ready. Rough list of things
-    # is below:
-
-    # Output formatting: Need to decide what output reports will actually look like and then do that instead of having
-    # information put up as print statements here and there
-
-    # Add more command line options/make the ones we have do something: threads and pvalue don't do anything right now,
-    # the database location option should be set to a sensible default, and more options will almost certainly come up.
-    # Should also probably get this set up as one main command with subparsers - at the very least one for running copy
-    # number estimation and another for any database manipulations that one might have. Should also have one for
-    # downloading/updating databases of single copy genes once I figure out what genes we're actually going to use.
-
-    # Lots of code right now is hilariously inefficient - for example, bam files are getting created multiple times
-    # instead of saving one copy and re-parsing it later. Also, option should get added to save the bam/other potential
-    # intermediate files that get created to somewhere instead of having them vanish from the face of the earth forever
-    # as soon as the leave the scope of the tempdir.
-
-    # Alleles selected for each gene are currently written to hardcoded genes_and_stuff.fasta. Set this to a reasonable
-    # default instead.
-
-    # No way to call this from within python right now, only available as CLI. Make some sort of method so other scripts
-    # can import and call from within python
-
-    # Lots of places need lots more logging statements.
     if not os.path.isdir(args.single_copy_gene_folder):
         logging.info('Single copy genes not found. Downloading them to {}'.format(args.single_copy_gene_folder))
         download_single_copy_genes(args.single_copy_gene_folder)
@@ -224,7 +152,8 @@ def main():
                             assembly=args.assembly,
                             pvalue=args.p_value,
                             database=args.database,
-                            report_file=args.output_report)
+                            report_file=args.output_report,
+                            threads=args.threads)
 
 
 def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, single_copy_gene_folder,
@@ -257,13 +186,16 @@ def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, sin
                 db_name = fasta_file.replace('.fasta', '')
                 # Create diamond database if it doesn't exist already.
                 if not os.path.isfile(db_name):
-                    cmd = 'diamond makedb --db {db_name} --in {ref_fasta}'.format(db_name=db_name,
-                                                                                  ref_fasta=fasta_file)
+                    cmd = 'diamond makedb --db {db_name} --in {ref_fasta} -p {threads}'.format(db_name=db_name,
+                                                                                               ref_fasta=fasta_file,
+                                                                                               threads=threads)
                     run_cmd(cmd)
                 diamond_report = os.path.join(tmpdir, 'diamond.tsv')
-                cmd = 'diamond blastx --query {assembly} --db {db_name} -o {outfile}'.format(assembly=assembly_to_use,
-                                                                                             db_name=db_name,
-                                                                                             outfile=diamond_report)
+                cmd = 'diamond blastx --query {assembly} --db {db_name} -p {threads} ' \
+                      '-o {outfile}'.format(assembly=assembly_to_use,
+                                            db_name=db_name,
+                                            outfile=diamond_report,
+                                            threads=threads)
                 run_cmd(cmd)
                 with open(diamond_report) as f:
                     lines = f.readlines()
@@ -294,7 +226,7 @@ def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, sin
             logging.info('Normal distribution mean: {}'.format(uncorr_avg))
             logging.info('Normal distribution stdev: {}'.format(uncorr_std))
 
-            logging.info('\nGC CORRECTED STATS:')
+            logging.info('GC CORRECTED STATS:')
             avg, std = norm.fit(np.array(corrected_depths))
             logging.info('Median depth: {}'.format(np.median(corrected_depths)))
             logging.info('Normal distribution mean: {}'.format(avg))
@@ -316,7 +248,8 @@ def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, sin
         for s in SeqIO.parse(genes_of_interest, 'fasta'):
             gene_names.append(s.id)
         logging.info('Calculating depths for target genes...')
-        depths = get_corrected_depths_per_gene(forward_reads, reverse_reads, genes_of_interest, gene_names, gc_dict, avg)
+        depths = get_corrected_depths_per_gene(forward_reads, reverse_reads, genes_of_interest, gene_names,
+                                               gc_dict, avg, sample_name, database)
         with open(report_file, 'w') as f:
             f.write('Gene,Depth,PossibleCopyNumbers,SingleCopyDepth,SingleCopyStdev,StdevMultiplier\n')
             for gene_name in depths:
@@ -358,7 +291,7 @@ def check_for_sample_in_database(sample_name, db_name):
     conn = sqlite3.connect(db_name)
     c = conn.cursor()
     # Step 1: Create our table if it doesn't already exist.
-    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text, avgdepth real, stdev real, gc json)')
+    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text PRIMARY KEY, avgdepth real, stdev real, gc json)')
     conn.commit()
     # See if our sample is there.
     c.execute('SELECT * FROM depths WHERE strain=?', sample_name)
@@ -373,12 +306,40 @@ def check_for_sample_in_database(sample_name, db_name):
         return (avg, stdev, gc)
 
 
+def check_for_gene_in_database(gene_name, sample_name, db_name):
+    conn = sqlite3.connect(db_name)
+    c = conn.cursor()
+    # Step 1: Create our table if it doesn't already exist.
+    c.execute('CREATE TABLE IF NOT EXISTS genes (gene text, strain text, gene_depth real, FOREIGN KEY (strain) REFERENCES depths(strain))')
+    conn.commit()
+    # Check for our sample!
+    c.execute('SELECT * FROM genes WHERE gene=? AND strain=?', (gene_name, sample_name))
+    table_row = c.fetchone()
+    conn.close()
+    if table_row is None:
+        return False
+    else:
+        gene, strain, depth = table_row
+        return depth
+
+
+def add_gene_to_database(gene_name, sample_name, gene_depth, db_name):
+    conn = sqlite3.connect(db_name)
+    c = conn.cursor()
+    # Step 1: Create our table if it doesn't already exist.
+    c.execute('CREATE TABLE IF NOT EXISTS genes (gene text, strain text, gene_depth real, FOREIGN KEY (strain) REFERENCES depths(strain))')
+    conn.commit()
+    c.execute('INSERT INTO genes VALUES (?, ?, ?)', (gene_name, sample_name, gene_depth))
+    conn.commit()
+    conn.close()
+
+
 def add_sample_to_database(sample_name, avgdepth, stdev, db_name, gc_dict):
     data_to_add = (sample_name, avgdepth, stdev, gc_dict)
     conn = sqlite3.connect(db_name)
     c = conn.cursor()
     # Step 1: Create our table if it doesn't already exist.
-    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text, avgdepth real, stdev real, gc json)')
+    c.execute('CREATE TABLE IF NOT EXISTS depths (strain text PRIMARY KEY, avgdepth real, stdev real, gc json)')
     conn.commit()
     # Now add our sample and commit changes.
     c.execute('INSERT INTO depths VALUES (?, ?, ?, ?)', data_to_add)
@@ -404,8 +365,18 @@ def find_most_likely_copy_number(single_copy_mean, single_copy_stdev, max_copy_n
     return copy_number_dict
 
 
-def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene_names, gc_dict, corrected_median_depth):
+def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene_names, gc_dict, corrected_median_depth,
+                                  sample_name, database):
     corrected_depths = dict()
+    genes_in_database = True
+    for gene_name in gene_names:
+        if check_for_gene_in_database(gene_name, sample_name, database) is False:
+            genes_in_database = False
+        else:
+            corrected_depths[gene_name] = check_for_gene_in_database(gene_name, sample_name, database)
+    if genes_in_database:
+        logging.info('All genes already stored in DB!')
+        return corrected_depths
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpfasta = os.path.join(tmpdir, gene_fasta)
         try:
@@ -434,6 +405,9 @@ def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene
         seq_index = SeqIO.index(tmpfasta, 'fasta')
         bamfile = pysam.AlignmentFile(sorted_bam, 'rb')
         for gene_name in gene_names:
+            if check_for_gene_in_database(gene_name, sample_name, database) is not False:
+                corrected_depths[gene_name] = check_for_gene_in_database(gene_name, sample_name, database)
+                continue
             logging.info(gene_name)
             gene_window_depths = list()
             # Find out what depth is and put it into corrected_depths dictionary.
@@ -465,6 +439,7 @@ def get_corrected_depths_per_gene(forward_reads, reverse_reads, gene_fasta, gene
                     # https://academic.oup.com/bioinformatics/article/31/11/1708/2365681
                     else:
                         corrected_depth = (depth * corrected_median_depth)/np.median(gc_dict[gc_content])
+                        add_gene_to_database(gene_name, sample_name, corrected_depth, database)
                         gene_window_depths.append(corrected_depth)
                 except ZeroDivisionError:
                     pass
