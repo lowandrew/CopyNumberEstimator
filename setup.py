@@ -15,7 +15,7 @@ setup(
     },
     author="Andrew Low",
     author_email="andrew.low@canada.ca",
-    url="https://github.com/OLC-Bioinformatics/ConFindr",
+    url="https://github.com/lowandrew/CopyNumberEstimator",
     install_requires=['biopython',
                       'matplotlib',
                       'pysam',
