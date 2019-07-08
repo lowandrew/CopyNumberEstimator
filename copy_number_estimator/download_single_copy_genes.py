@@ -39,8 +39,7 @@ def download_single_copy_genes(output_folder):
             f.write(fasta_content.decode('utf-8'))
         downloaded_count += 1
 
-
-if __name__ == '__main__':
+def main():
     logging.basicConfig(format='\033[92m \033[1m %(asctime)s \033[0m %(message)s ',
                         level=logging.INFO,
                         datefmt='%Y-%m-%d %H:%M:%S')
@@ -51,3 +50,7 @@ if __name__ == '__main__':
                         help='Folder to store universal(ish) single copy(ish) genes. Must not already exist.')
     args = parser.parse_args()
     download_single_copy_genes(output_folder=args.output_directory)
+
+
+if __name__ == '__main__':
+    main()

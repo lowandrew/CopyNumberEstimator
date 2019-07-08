@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from download_single_copy_genes import download_single_copy_genes
+from copy_number_estimator.download_single_copy_genes import download_single_copy_genes
 from scipy.stats import norm
 import multiprocessing
 from Bio import SeqIO
@@ -113,32 +113,13 @@ def main():
     Here's the plan for CopyNumberEstimator (name is subject to change) - probably wouldn't be too bad to adapt this to
     work with PacBio/Nanopore as well, but given that you get good read length with them it's much less of an issue.
 
-    Big questions:
-    How many single copy genes to include? More is probably better, but will eventually hit a point where we don't need
-    any more to approximate the distribution of depths and we'll just be burning compute time.
-
-    How to approximate distributions for multi-copy genes? My intuition is that the variance on distributions for genes
-    with more copies will be bigger, but this should actually get backed up somehow if possible. Do some empirical
-    testing to find out?
-
     Implementation:
-    0) For all of our conserved single copy genes, figure out which allele is actually present in our reads. Use KMA
-    for this for now, but may need to find something better at some point. KMA has been more buggy than I'd like it
-    to be.
     1) Take a set of reads (going to assume Illumina, paired end) and align them back to a set of conserved, single
     copy genes.
-    2) Also align that set of reads against whatever our target gene (or genes are) to figure out their read depths.
-    3) Potentially do some correction of read depths based on GC percent, which literature says can bias things. This
-    would likely get done as part of steps 1 and 2 and wouldn't really be a separate step. CNOGpro paper has an equation
-    that might be steal-able
-    4) Take the depths from our known single copy genes and fit them to some sort of distribution (read some papers to
-    figure out what kind of distribution we'd expect - normal distribution might work?)
-    5) Compare the depths for each of our genes of interest to the distribution and do some stats to figure out if
-    we're significantly outside of the distribution. Could extrapolate distribution to other copy numbers (so if
-    single copy genes average 50X depth, assume same distribution around 100X corresponds to two copies? Likely to end up
-    with more variance as copy number gets higher, so that would have to be taken into consideration as well).
-    6) Optionally, can also do a search for minor variants that correspond to multiple alleles of a gene being present
-    in a genome.
+    2) Do some correction of read depths based on GC percent, which literature says can bias things.
+    3) Take the depths from our known single copy genes and fit them to a normal distribution.
+    4) Find depths for each of our target genes, and see if they fall within the normal distribution. Also check normal
+    distributions for higher copy number things.
     """
     if not os.path.isdir(args.single_copy_gene_folder):
         logging.info('Single copy genes not found. Downloading them to {}'.format(args.single_copy_gene_folder))
@@ -158,7 +139,7 @@ def main():
 
 def make_copy_number_report(forward_reads, reverse_reads, genes_of_interest, single_copy_gene_folder,
                             assembly=None, pvalue=0.05, threads=1, database='test_db', stdev_multiplier=1.1,
-                            max_copy_number=10, read_identifier='_R1', report_file='copy_number_report.csv'):
+                            max_copy_number=20, read_identifier='_R1', report_file='copy_number_report.csv'):
     if check_dependencies() is False:
         logging.error('Some necessary dependencies not found. Exiting..')
         quit(code=1)

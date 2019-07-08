@@ -20,7 +20,7 @@ def create_plot(mean, stdev, max_copy, stdev_multiplier, gene_depth, gene_name):
     plt.show()
 
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-r', '--copy_number_report',
                         type=str,
@@ -50,3 +50,6 @@ if __name__ == '__main__':
     if gene_found is False:
         print('Could not find specified gene in report.')
 
+
+if __name__ == '__main__':
+    main()
